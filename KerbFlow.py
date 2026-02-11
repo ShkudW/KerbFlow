@@ -503,6 +503,129 @@ def _filetime_to_iso(ft) -> str:
 
 ##################################################
 
+def parse_pac_s4u_delegation_info(buf: bytes):
+    """
+    Parse PAC_S4U_DELEGATION_INFO (Type 11)
+    Reference: [MS-PAC] 2.9 S4U_DELEGATION_INFO
+    
+    Structure:
+        RPC_UNICODE_STRING S4U2proxyTarget;
+        ULONG TransitedListSize;
+        [size_is(TransitedListSize)] PRPC_UNICODE_STRING S4UTransitedServices;
+    """
+    info = {
+        "S4U2proxyTarget": None,
+        "TransitedListSize": 0,
+        "S4UTransitedServices": []
+    }
+    
+    try:
+        # Skip TypeSerialization1 header
+        ts1 = TypeSerialization1(buf)
+        data = buf[len(ts1)+4:]
+        offset = 0
+        
+        # Parse S4U_DELEGATION_INFO structure
+        # Field 1: RPC_UNICODE_STRING S4U2proxyTarget (8 bytes in NDR)
+        s4u2proxy_target_len = unpack_from("<H", data, offset)[0]
+        s4u2proxy_target_maxlen = unpack_from("<H", data, offset + 2)[0]
+        offset += 4
+        s4u2proxy_target_ptr = unpack_from("<I", data, offset)[0]
+        offset += 4
+        
+        # Field 2: ULONG TransitedListSize
+        transited_list_size = unpack_from("<I", data, offset)[0]
+        offset += 4
+        info["TransitedListSize"] = transited_list_size
+        
+        # Field 3: Pointer to S4UTransitedServices array
+        s4u_transited_services_ptr = unpack_from("<I", data, offset)[0]
+        offset += 4
+        
+        print(f"{Colors.GREEN}[>] S4U_DELEGATION_INFO{Colors.RESET}")
+        print(f"    {Colors.CYAN}[*] TransitedListSize: {Colors.RESET}{transited_list_size}")
+        
+        # Parse deferred data (NDR conformant arrays)
+        
+        # Parse S4U2proxyTarget string
+        if s4u2proxy_target_len > 0:
+            # NDR conformant/varying array header
+            max_count = unpack_from("<I", data, offset)[0]
+            offset += 4
+            array_offset = unpack_from("<I", data, offset)[0]
+            offset += 4
+            actual_count = unpack_from("<I", data, offset)[0]
+            offset += 4
+            
+            # Read UTF-16LE string (actual_count is in characters)
+            string_bytes = actual_count * 2
+            if offset + string_bytes <= len(data):
+                s4u2proxy_target = data[offset:offset + string_bytes].decode('utf-16le', errors='ignore').rstrip('\x00')
+                info["S4U2proxyTarget"] = s4u2proxy_target
+                print(f"    {Colors.CYAN}[*] S4U2proxyTarget: {Colors.RESET}{s4u2proxy_target}")
+                offset += string_bytes
+                
+                # Align to 4-byte boundary
+                remainder = offset % 4
+                if remainder:
+                    offset += (4 - remainder)
+        
+        # Parse S4UTransitedServices array
+        if transited_list_size > 0:
+            # Array conformance: MaxCount
+            max_count = unpack_from("<I", data, offset)[0]
+            offset += 4
+            
+            # Array of RPC_UNICODE_STRING structures (8 bytes each in NDR)
+            services_metadata = []
+            for i in range(transited_list_size):
+                svc_len = unpack_from("<H", data, offset)[0]
+                svc_maxlen = unpack_from("<H", data, offset + 2)[0]
+                svc_ptr = unpack_from("<I", data, offset + 4)[0]
+                services_metadata.append((svc_len, svc_maxlen, svc_ptr))
+                offset += 8
+            
+            # Parse actual string data for each transited service
+            print(f"    {Colors.CYAN}[*] S4UTransitedServices:{Colors.RESET}")
+            for i, (svc_len, svc_maxlen, svc_ptr) in enumerate(services_metadata):
+                if svc_len > 0 and offset < len(data):
+                    # Conformant/varying array header
+                    max_count = unpack_from("<I", data, offset)[0]
+                    offset += 4
+                    array_offset = unpack_from("<I", data, offset)[0]
+                    offset += 4
+                    actual_count = unpack_from("<I", data, offset)[0]
+                    offset += 4
+                    
+                    # Read UTF-16LE string
+                    string_bytes = actual_count * 2
+                    if offset + string_bytes <= len(data):
+                        service_name = data[offset:offset + string_bytes].decode('utf-16le', errors='ignore').rstrip('\x00')
+                        info["S4UTransitedServices"].append(service_name)
+                        print(f"        {Colors.GREEN}[{i}] {Colors.RESET}{service_name}")
+                        offset += string_bytes
+                        
+                        # Align to 4-byte boundary
+                        remainder = offset % 4
+                        if remainder:
+                            offset += (4 - remainder)
+        
+        # Summary output matching MS-PAC spec terminology
+        if not info["S4U2proxyTarget"] and info["TransitedListSize"] == 0:
+            print(f"    {Colors.DIM}[*] No delegation information present{Colors.RESET}")
+        
+    except Exception as e:
+        print(f"    {Colors.RED}[!] S4U_DELEGATION_INFO parse error: {e}{Colors.RESET}")
+        import traceback
+        if PAC_VERBOSE:
+            traceback.print_exc()
+        print(f"    {Colors.DIM}[*] Raw hex: {buf.hex()}{Colors.RESET}")
+        return {"_error": f"S4U_DELEGATION_INFO parse failed: {e}"}
+    
+    return info
+
+##################################################
+
 def parse_pac_logon_info(buf_bytes: bytes):
     info = {"User": {}, "Domain": {}, "Groups": [], "ExtraSids": [], "ResourceGroups": [], "Times": {}}
     
@@ -1137,7 +1260,12 @@ def pretty_print_enc_ticket_part_and_pac(decrypted_enc_ticket_part_bytes: bytes)
                 claims = parse_pac_claims_info(data)
                 for k, v in claims.items():
                     print(f"    {Colors.CYAN}[*] {k}: {Colors.RESET}{v}")
-            
+
+            elif t == 11:  
+                s4u_info = parse_pac_s4u_delegation_info(data)
+                if "_error" not in s4u_info:
+                    # Already printed by the function
+                    pass          
             else:
                 print(f"{Colors.YELLOW}[>] Unknown PAC type {t} (size: {len(data)} bytes){Colors.RESET}")
                 if len(data) <= 100:
